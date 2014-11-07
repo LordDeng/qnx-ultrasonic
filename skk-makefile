@@ -1,0 +1,10 @@
+
+build : qnx-ultrasonic.o timing.o
+	gcc qnx-ultrasonic.o timing.o -o qnx-ultrasonic -lpthread -lrt
+
+qnx-ultrasonic.o : qnx-ultrasonic.c timing.c
+	gcc -c qnx-ultrasonic.c timing.c -lpthread -lrt
+
+timing.o : timing.c
+	gcc -c timing.c -lrt
+	
