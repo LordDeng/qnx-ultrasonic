@@ -56,14 +56,13 @@ int timing_timespec_sub(result, x, y)
 void timing_future_nanos(struct timespec *future, long my_nanos)
 {
 	clock_gettime(CLOCK_REALTIME, future);
-	future->tv_sec += 4;
-	/*long rt_nanos = future->tv_nsec;
+	long rt_nanos = future->tv_nsec;
 
 	if(rt_nanos + my_nanos > 1000000000) {
 		future->tv_nsec = (rt_nanos + my_nanos) - 1000000000;
 		future->tv_sec++;
 	} else {
 		future->tv_nsec += my_nanos;
-	} */
+	} 
 }
 

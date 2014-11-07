@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
@@ -6,6 +7,10 @@
 #include <sys/stat.h>
 #include <mqueue.h>
 #include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <unistd.h>
+#include <termios.h>
 #include "timing.h"
 
 static int get_micros_stub(void);
@@ -14,17 +19,45 @@ static int get_micros_ultrasonic(void);
 static void prod(int (*get_micros)(void));
 static void cons(void);
 static void disp(void);
+static void qthd(void);
 
 static int micros_to_inches(int micros);
 
 static const char* MQ_C_NAME = "/mq_to_cons";
 static const char* MQ_D_NAME = "/mq_to_disp";
 
-#define DEBUGF printf
+static pthread_mutex_t quit_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int quit;
+
+void raw()
+{
+	struct termios tio;
+	  
+	tcgetattr(0, &tio);
+	tio.c_lflag &= ~ICANON;
+	tcsetattr(0, TCSANOW, &tio);
+}
+
+void noraw()
+{
+	struct termios tio;
+
+	tcgetattr(0, &tio);
+	tio.c_lflag |= ICANON;
+	tcsetattr(0, TCSANOW, &tio);
+}
 
 #define USE_STUB 1
 int main(int argc, char *argv[])
 {
+	raw();
+	atexit(&noraw);
+
+	printf("Press any key to start measurements:\n");
+	getchar();
+
+	quit = 0;
+
 	mq_unlink(MQ_C_NAME);
 	mq_unlink(MQ_D_NAME);
 
@@ -37,19 +70,18 @@ int main(int argc, char *argv[])
 	mqd_t mq_c = mq_open(MQ_C_NAME, O_CREAT | O_WRONLY, S_IRWXU, &mq_at);
 	mqd_t mq_d = mq_open(MQ_D_NAME, O_CREAT | O_WRONLY, S_IRWXU, &mq_at);
 
-	/*mq_getattr(mq_c, &mq_at);
-	printf("long mq_maxmsg: %ld\n", mq_at.mq_maxmsg);
-	printf("long mq_msgsize: %ld\n", mq_at.mq_msgsize);
-	printf("long mq_curmsgs: %ld\n", mq_at.mq_curmsgs);*/
-
-	pthread_attr_t at_p, at_c, at_d;
+	pthread_attr_t at_p, at_c, at_d, at_q;
 	pthread_attr_init(&at_p);
 	pthread_attr_init(&at_c);
 	pthread_attr_init(&at_d);
+	pthread_attr_init(&at_q);
 
 	int policy;
 	struct sched_param sched;
 	pthread_getschedparam(pthread_self(), &policy, &sched);
+
+	sched.sched_priority--;
+	pthread_attr_setschedparam(&at_q, &sched);
 
 	sched.sched_priority--;
 	pthread_attr_setschedparam(&at_p, &sched);
@@ -75,15 +107,36 @@ int main(int argc, char *argv[])
 	pthread_t thd_disp;
 	pthread_create(&thd_disp, &at_d, (void *) disp, NULL);
 
+	pthread_t thd_qthd;
+	pthread_create(&thd_qthd, &at_q, (void *) qthd, NULL);
+
+	pthread_join(thd_qthd, NULL);
 	pthread_join(thd_prod, NULL);
 	pthread_join(thd_cons, NULL);
 	pthread_join(thd_disp, NULL);
+
+	printf("\rDone.\n");
 
 	mq_close(mq_c);
 	mq_close(mq_d);
 
 	mq_unlink(MQ_C_NAME);
 	mq_unlink(MQ_D_NAME);
+}
+
+static void qthd(void)
+{
+	char ch;
+	while(1) {
+		read(STDIN_FILENO, &ch, 1);
+		if(ch == 'q' || ch == 'Q') {
+			break;
+		}
+	}
+
+	pthread_mutex_lock(&quit_mutex);
+	quit = 1;
+	pthread_mutex_unlock(&quit_mutex);
 }
 
 static int get_micros_last = 1000;
@@ -111,14 +164,18 @@ static void prod(int (*get_micros)(void))
 	int micros;
 	char msg[sizeof(micros)];
 
-	while(1) {
+	int thd_quit = 0;
+	while(!thd_quit) {
 		clock_gettime(CLOCK_REALTIME, &init);
+
+		pthread_mutex_lock(&quit_mutex);
+		thd_quit = quit;
+		pthread_mutex_unlock(&quit_mutex);
 
 		micros = get_micros();
 		memcpy(msg, &micros, sizeof(micros));
 
 		mq_send(mq_c, msg, sizeof(micros), 0);
-		//DEBUGF("prod->cons\n");
 
 		clock_gettime(CLOCK_REALTIME, &post);
 		neg = timing_timespec_sub(&elap, &post, &init);
@@ -144,8 +201,16 @@ static void cons()
 
 	int inches;
 
-	while(1) {
-		mq_receive(mq_c, msg, sizeof(micros), NULL);
+	struct timespec abs;
+
+	int thd_quit = 0;
+	while(!thd_quit) {
+		pthread_mutex_lock(&quit_mutex);
+		thd_quit = quit;
+		pthread_mutex_unlock(&quit_mutex);
+
+		timing_future_nanos(&abs, 500000000);
+		mq_timedreceive(mq_c, msg, sizeof(micros), NULL, &abs);
 		memcpy(&micros, msg, sizeof(micros));
 
 		inches = micros_to_inches(micros);	
@@ -154,8 +219,9 @@ static void cons()
 			inches = ULTRA_INVALID;
 		}
 
+		timing_future_nanos(&abs, 500000000);
 		memcpy(msg, &inches, sizeof(inches));
-		mq_send(mq_d, msg, sizeof(inches), 0);
+		mq_timedsend(mq_d, msg, sizeof(inches), 0, &abs);
 	}
 }
 
@@ -180,30 +246,48 @@ static void disp()
 	int aster_on = 0;
 
 	const int HALF_PERIOD = ASTER_FLASH_PERIOD_NANOS / 2;
-	
-	printf("Measurement in inches:\n");
+	struct timespec init, post, elap;
+	init.tv_sec = ULONG_MAX;
+	init.tv_nsec = 0;
 
+	printf("\rMeasurement in inches:\n");
+
+	int thd_quit = 0;
 	ssize_t sz;
-	while(1) {
+	while(!thd_quit) {
+		pthread_mutex_lock(&quit_mutex);
+		thd_quit = quit;
+		pthread_mutex_unlock(&quit_mutex);
+
 		timing_future_nanos(&abs, HALF_PERIOD);
 		sz = mq_timedreceive(mq_d, msg, sizeof(inches), NULL, &abs);
 		if(sz > 0) {
-			//printf("hello\n");
 			memcpy(&inches, msg, sizeof(inches));
-			snprintf(buf, MAX_BUF, "%d  ", inches);
+			if(inches != ULTRA_INVALID) {
+				snprintf(buf, MAX_BUF, "%d", inches);
+			}
 		} else {
-			perror("");
+			//perror("");
 		}
 
 		if(inches == ULTRA_INVALID) {
-			if((aster_on = !aster_on)) {
-				snprintf(buf, MAX_BUF, "%s", "*  ");
-			} else {
-				snprintf(buf, MAX_BUF, "%s", "   ");
+			clock_gettime(CLOCK_REALTIME, &post);
+			int neg = timing_timespec_sub(&elap, &post, &init);
+
+			if(neg || elap.tv_nsec > HALF_PERIOD) {
+				if((aster_on = !aster_on)) {
+					snprintf(buf, MAX_BUF, "%s", "*");
+				} else {
+					snprintf(buf, MAX_BUF, "%s", " ");
+				}
+
+				clock_gettime(CLOCK_REALTIME, &init);
 			}
 		}
 
-		printf("%s\r", buf);
+		printf("\r%80s", "");
+		fflush(stdout);
+		printf("\r%s", buf);
 		fflush(stdout);
 	}
 }
