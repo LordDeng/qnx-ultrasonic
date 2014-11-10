@@ -4,14 +4,14 @@
 #include <pthread.h>
 #include <sched.h>
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <mqueue.h>
 #include <errno.h>
 #include <limits.h>
-#include <signal.h>
 #include <unistd.h>
 #include <termios.h>
 #include "timing.h"
+
+/* Function prototypes */
 
 static int get_micros_stub(void);
 static int get_micros_ultrasonic(void);
@@ -23,52 +23,76 @@ static void qthd(void);
 
 static int micros_to_inches(int micros);
 
+/* 
+ * Name of message queue to the consumer thread
+ */
 static const char* MQ_C_NAME = "/mq_to_cons";
+
+/*
+ * Name of message queue to the display thread
+ */
 static const char* MQ_D_NAME = "/mq_to_disp";
 
+/*
+ * Mutex over the quit boolean
+ */
 static pthread_mutex_t quit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int quit;
 
-void raw()
+/*
+ * Send STDIN_FILENO into raw mode
+ */
+static void raw()
 {
 	struct termios tio;
 	  
-	tcgetattr(0, &tio);
+	tcgetattr(STDIN_FILENO, &tio);
 	tio.c_lflag &= ~ICANON;
-	tcsetattr(0, TCSANOW, &tio);
+	tcsetattr(STDIN_FILENO, TCSANOW, &tio);
 }
 
-void noraw()
+/*
+ * Bring STDIN_FILENO out of raw mode
+ */
+static void noraw()
 {
 	struct termios tio;
 
-	tcgetattr(0, &tio);
+	tcgetattr(STDIN_FILENO, &tio);
 	tio.c_lflag |= ICANON;
-	tcsetattr(0, TCSANOW, &tio);
+	tcsetattr(STDIN_FILENO, TCSANOW, &tio);
 }
 
+/*
+ * Creates all threads and creates the message queues. Then, joins on all
+ * threads and ends the program.
+ *
+ * If USE_STUB = 1, then a stub method will be used for micros input.
+ * Otherwise, the ultrasonic sensor will be used for input.
+ */
 #define USE_STUB 1
 int main(int argc, char *argv[])
 {
-	raw();
-	atexit(&noraw);
+	raw(); /* Use raw mode so getchar() doesn't buffer */
+	atexit(&noraw); /* At the end of the program, unraw stdin */
 
 	printf("Press any key to start measurements:\n");
 	getchar();
 
 	quit = 0;
 
+	/* Destroy the queues if they already exist (to refresh params) */
 	mq_unlink(MQ_C_NAME);
 	mq_unlink(MQ_D_NAME);
 
 	struct mq_attr mq_at;
 	mq_at.mq_flags = 0;
 	mq_at.mq_maxmsg = 10;
-	mq_at.mq_msgsize = sizeof(int);
+	mq_at.mq_msgsize = sizeof(int); /* All messages are int-width */
 	mq_at.mq_curmsgs = 0;
 
-	mqd_t mq_c = mq_open(MQ_C_NAME, O_CREAT | O_WRONLY, S_IRWXU, &mq_at);
-	mqd_t mq_d = mq_open(MQ_D_NAME, O_CREAT | O_WRONLY, S_IRWXU, &mq_at);
+	mqd_t mq_c = mq_open(MQ_C_NAME, O_CREAT | O_RDONLY, S_IRWXU, &mq_at);
+	mqd_t mq_d = mq_open(MQ_D_NAME, O_CREAT | O_RDONLY, S_IRWXU, &mq_at);
 
 	pthread_attr_t at_p, at_c, at_d, at_q;
 	pthread_attr_init(&at_p);
@@ -110,6 +134,8 @@ int main(int argc, char *argv[])
 	pthread_t thd_qthd;
 	pthread_create(&thd_qthd, &at_q, (void *) qthd, NULL);
 
+	/* All threads do their work here */
+
 	pthread_join(thd_qthd, NULL);
 	pthread_join(thd_prod, NULL);
 	pthread_join(thd_cons, NULL);
@@ -124,6 +150,10 @@ int main(int argc, char *argv[])
 	mq_unlink(MQ_D_NAME);
 }
 
+/*
+ * The quit thread's backing function waits until the quit key is entered.
+ * Then, it changes the quit flag to true.
+ */
 static void qthd(void)
 {
 	char ch;
