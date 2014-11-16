@@ -1,3 +1,22 @@
+/*
+ * Proj: 5
+ * File: qnx-ultrasonic.c
+ * Date: 15 November 2014
+ * Auth: Steven Kroh (skk8768)
+ *
+ * Description:
+ *
+ * This file contains the main implementation of Lab 5. It obtains data
+ * from the ultrasonic sensor every 1/10 second and displays the current
+ * distance in inches to the terminal in a pretty manner.
+ *
+ * NOTE: The output of this program must be viewed on the QNX root console
+ * over VGA. The display requirements of this lab may only be satisfied in that
+ * environment, as only the QNX root console provides *all* termios
+ * functionality. The eclipse console (grabbing text over qconn) does not
+ * display carriage returns correctly (and thus will not prevent scrolling).
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,10 +30,10 @@
 #include <termios.h>
 #include <time.h>
 #include <hw/inout.h>
-#include <stdint.h>       /* for uintptr_t */
+#include <stdint.h> /* for uintptr_t */
 #include <sys/neutrino.h> /* for ThreadCtl() */
 #include <inttypes.h>
-#include <sys/mman.h>     /* for mmap_device_io() */
+#include <sys/mman.h> /* for mmap_device_io() */
 #include "timing.h"
 
 /* Function prototypes */
@@ -22,11 +41,14 @@
 static int get_micros_stub(void);
 static int get_micros_ultrasonic(void);
 
-static void prod(int(*get_micros)(void));
-static void cons(void);
-static void disp(void);
-static void qthd(void);
+static void prod(int(*get_micros)(void)); /* Producer thread */
+static void cons(void); /* Consumer thread */
+static void disp(void); /* Display thread */
+static void qthd(void); /* Wait-for-quit thread */
 
+/*
+ * Converts a travel time in microseconds to a travel distance in inches
+ */
 static int micros_to_inches(int micros);
 
 /* 
@@ -70,6 +92,9 @@ static int raw(int fd) {
 	return (tcsetattr(fd, TCSADRAIN, &termios_p));
 }
 
+/**
+ * Void helper function on STDIN_FILENO that can be used by atexit()
+ */
 static void raw_stdin() {
 	raw(0);
 }
@@ -94,6 +119,9 @@ static int unraw(int fd) {
 	return (tcsetattr(fd, TCSADRAIN, &termios_p));
 }
 
+/**
+ * Void helper function on STDIN_FILENO that can be used by atexit()
+ */
 static void unraw_stdin() {
 	unraw(0);
 }
@@ -114,8 +142,12 @@ int main(int argc, char *argv[]) {
 	printf("To end the program, press 'q' or 'Q'\n\r");
 	getchar();
 
-	quit = 0;
+	quit = 0; /* qthd sets this to 1 to end the program */
 
+	/*
+	 * To use nanosleep or clock_gettime effectively, we need to set the
+	 * resolution of the realtime clock in the microsecond range.
+	 */
 	struct _clockperiod clk;
 	clk.fract = 0;
 	clk.nsec = 10000;
@@ -128,7 +160,7 @@ int main(int argc, char *argv[]) {
 	//	clock_getres(CLOCK_REALTIME, &res);
 	//	printf("res: %ld", res.tv_nsec);
 
-	/* Destroy the queues if they already exist (to refresh params) */
+	/* Destroy the queues if they already exist (to refresh their params) */
 	mq_unlink(MQ_C_NAME);
 	mq_unlink(MQ_D_NAME);
 
@@ -151,6 +183,7 @@ int main(int argc, char *argv[]) {
 	struct sched_param sched;
 	pthread_getschedparam(pthread_self(), &policy, &sched);
 
+	/* The producer thread has the highest priority to use hw */
 	sched.sched_priority++;
 	pthread_attr_setschedparam(&at_p, &sched);
 
@@ -163,6 +196,9 @@ int main(int argc, char *argv[]) {
 	sched.sched_priority--;
 	pthread_attr_setschedparam(&at_q, &sched);
 
+	/*
+	 * The producer thread will get data from the function stored in get_micros
+	 */
 	int (*get_micros)(void);
 #if USE_STUB
 	get_micros = &get_micros_stub;
@@ -204,7 +240,8 @@ int main(int argc, char *argv[]) {
 
 /*
  * The quit thread's backing function waits until the quit key is entered.
- * Then, it changes the quit flag to true.
+ * Then, it changes the quit flag to true. This thread relies on STDIN being
+ * in raw mode.
  */
 static void qthd(void) {
 	char ch;
@@ -220,46 +257,67 @@ static void qthd(void) {
 	pthread_mutex_unlock(&quit_mutex);
 }
 
+/*
+ * The stub function starts at 1000 micros and increments that base by 10
+ * each time it is accessed. Use this stub to test the code infrastructure
+ * without using the ultrasonic hw.
+ */
 static int get_micros_last = 1000;
 static int get_micros_stub(void) {
 	return (get_micros_last += 10);
 }
 
-static uintptr_t ctrl_handle;
-static uintptr_t dioa_handle;
-static uintptr_t diob_handle;
+static uintptr_t ctrl_handle; /* Handle for daq control register */
+static uintptr_t dioa_handle; /* Handle for daq register A (out) */
+static uintptr_t diob_handle; /* Handle for daq register B (in) */
 
 # define BASE_ADDRESS 0x280
-
 # define CTRL_ADDRESS (BASE_ADDRESS + 11)
 # define DIOA_ADDRESS (BASE_ADDRESS + 8)
 # define DIOB_ADDRESS (BASE_ADDRESS + 9)
-
 # define PORT_LENGTH 1
 
-# define DATA_CONTROL_BIT 0x2
+# define CONTROL_REGISTER_CONFIG 0x2 /* Reg A out (trig); Reg B in (echo) */
 # define HIGH 0xFF
 # define LOW 0x00
 
+/*
+ * Triggers the ultrasonic sensor, waits for the echo, and measures the length
+ * of the echo in microseconds. This function blocks until that measurement
+ * is complete and returns the measurement in microseconds.
+ */
 static int get_micros_ultrasonic(void) {
 	struct timespec init, post, elap;
-	struct timespec pulseTime;
-	pulseTime.tv_sec = (time_t) 0;
-	//pulseTime.tv_nsec = 8000000;
-	pulseTime.tv_nsec = 10000;
+	struct timespec pulse_time;
+	pulse_time.tv_sec = (time_t) 0;
+	pulse_time.tv_nsec = 10000; /* The initial trigger pulse is 10us */
 
-	/* Pulse on a */
+	/* Pulse on A */
 	out8(dioa_handle, HIGH );
-	nanospin(&pulseTime);
+	nanospin(&pulse_time);
 	out8(dioa_handle, LOW );
 
-	pulseTime.tv_nsec = 4000;
-	nanospin(&pulseTime);
+	/* Wait for the sensor to send the pulse */
+	pulse_time.tv_nsec = 4000;
+	nanospin(&pulse_time);
 
-	//uint8_t pulse_status;
+	/* Taking the inverse of in8, we want to measure the low burst width.
+	 * We want to see the burst width on any pin, so we have to use inequality
+	 * operators on the whole incoming byte.
+	 *
+	 *          /- go low (~in8 == 0)
+	 *          |
+	 *          |     /- go high (~in8 > 0)
+	 *          |     |
+	 *          v     v
+	 * +5 ``````|     |```````
+	 *  0       |_____|
+	 *
+	 *          |<--->| low burst width is the length of the echo
+	 *          t0    t
+	 */
 	int8_t signed_pulse;
-
-	/* Poll b until high */
+	/* Poll B until high */
 	while (1) {
 		signed_pulse = ~in8(diob_handle);
 		if (signed_pulse == (uint8_t) 0) {
@@ -267,7 +325,7 @@ static int get_micros_ultrasonic(void) {
 		}
 	}
 	/* Start timer */
-	clock_gettime(CLOCK_REALTIME, &init);
+	clock_gettime(CLOCK_REALTIME, &init); /* Time t0 */
 	/* Poll b until low */
 	while (1) {
 		signed_pulse = ~in8(diob_handle);
@@ -276,28 +334,39 @@ static int get_micros_ultrasonic(void) {
 		}
 	}
 	/* End timer */
-	clock_gettime(CLOCK_REALTIME, &post);
+	clock_gettime(CLOCK_REALTIME, &post); /* Time t */
 
+	/* Calculate the elapsed time: t - t0 */
 	timing_timespec_sub(&elap, &post, &init);
 
 	/* Return microseconds */
 	return (elap.tv_nsec / 1000);
 }
 
+/*
+ * The producer thread obtains a raw data point from the get_micros function
+ * every tenth of a second. This thread does not clean the data, it just passes
+ * data points off to the consumer thread.
+ *
+ * This separation is designed such that the producer thread may run at the
+ * highest priority with the effect of getting more time to handle the sensor.
+ *
+ * This thread communicates with the producer over the mq_c channel.
+ */
 #define QUEUE_PLUG -2
 static void prod(int(*get_micros)(void)) {
 	mqd_t mq_c = mq_open(MQ_C_NAME, O_WRONLY);
 
-	/* set permissions */
+	/* Gain hw access permissions */
 	ThreadCtl(_NTO_TCTL_IO, NULL);
 
-	/* mmap */
+	/* mmap data regions to handles */
 	ctrl_handle = mmap_device_io(PORT_LENGTH, CTRL_ADDRESS);
 	dioa_handle = mmap_device_io(PORT_LENGTH, DIOA_ADDRESS);
 	diob_handle = mmap_device_io(PORT_LENGTH, DIOB_ADDRESS);
 
-	/* set control register bits */
-	out8(ctrl_handle, DATA_CONTROL_BIT );
+	/* Set control register bits */
+	out8(ctrl_handle, CONTROL_REGISTER_CONFIG );
 
 	struct timespec init, post, elap;
 	struct timespec diff;
@@ -310,7 +379,7 @@ static void prod(int(*get_micros)(void)) {
 
 	int thd_quit = 0;
 	while (!thd_quit) {
-		clock_gettime(CLOCK_REALTIME, &init);
+		clock_gettime(CLOCK_REALTIME, &init); /* Time how long daq takes */
 
 		pthread_mutex_lock(&quit_mutex);
 		thd_quit = quit;
@@ -321,35 +390,42 @@ static void prod(int(*get_micros)(void)) {
 
 		mq_send(mq_c, msg, sizeof(micros), 0);
 
-		clock_gettime(CLOCK_REALTIME, &post);
+		clock_gettime(CLOCK_REALTIME, &post); /* End daq timer */
+		/*
+		 * Sleep the difference between the full 1/10 second and the
+		 * elapsed daq time. (This creates a 1/10 second heartbeat
+		 */
 		neg = timing_timespec_sub(&elap, &post, &init);
 		neg = timing_timespec_sub(&elap, &diff, &elap);
-
 		/* If there is time before the next tenth-second, sleep */
 		if (!neg) {
 			clock_nanosleep(CLOCK_REALTIME, 0, &elap, NULL);
 		}
 	}
 
+	/* Before ending the thread, plug the consumer's queue */
 	micros = QUEUE_PLUG;
 	memcpy(msg, &micros, sizeof(micros));
 	mq_send(mq_c, msg, sizeof(micros), 0);
 }
 
-//static const int ULTRA_EXC_HIBND = 20;
-static const int ULTRA_EXC_HIBND =  2147483647;
-static const int ULTRA_INC_LOBND = 0;
+//static const int ULTRA_EXC_HIBND = 2147483647;
+static const int ULTRA_EXC_HIBND = 20; /* The maximum permissible inch range */
+static const int ULTRA_INC_LOBND = 0; /* The minimum permissible inch range */
+/* Represents a number of inches not in the above range */
 static const int ULTRA_INVALID = -1;
+/*
+ * The consumer thread receives microsecond messages from the producer,
+ * converts those microseconds to inches, and forwards those results for
+ * display by the display thread.
+ */
 static void cons() {
 	mqd_t mq_c = mq_open(MQ_C_NAME, O_RDONLY);
 	mqd_t mq_d = mq_open(MQ_D_NAME, O_WRONLY);
 
 	int micros;
 	char msg[sizeof(micros)];
-
 	int inches;
-
-	struct timespec abs;
 
 	int thd_quit = 0;
 	while (!thd_quit) {
@@ -357,18 +433,17 @@ static void cons() {
 		thd_quit = quit;
 		pthread_mutex_unlock(&quit_mutex);
 
-//		timing_future_nanos(&abs, 500000000);
-//		mq_timedreceive(mq_c, msg, sizeof(micros), NULL, &abs);
 		mq_receive(mq_c, msg, sizeof(micros), NULL);
 		memcpy(&micros, msg, sizeof(micros));
 
+		/* If no more data will be coming from the producer, quit now */
 		if (micros == QUEUE_PLUG) {
 			break;
 		}
 
 		inches = micros_to_inches(micros);
 		if (ULTRA_INC_LOBND <= inches && inches < ULTRA_EXC_HIBND) {
-			if (inches < min_inches)
+			if (inches < min_inches) /* Calculate statistics */
 				min_inches = inches;
 			if (inches > max_inches)
 				max_inches = inches;
@@ -376,34 +451,49 @@ static void cons() {
 			inches = ULTRA_INVALID;
 		}
 
-//		timing_future_nanos(&abs, 500000000);
 		memcpy(msg, &inches, sizeof(inches));
-//		mq_timedsend(mq_d, msg, sizeof(inches), 0, &abs);
 		mq_send(mq_d, msg, sizeof(inches), 0);
 	}
 
+	/* Before ending the thread, plug the display thread's queue */
 	inches = QUEUE_PLUG;
 	memcpy(msg, &inches, sizeof(inches));
 	mq_send(mq_d, msg, sizeof(inches), 0);
 }
 
+/*
+ * Converts travel time in microseconds to travel distance in inches
+ */
 static const int IN_DIVISOR = 71;
 static int micros_to_inches(int micros) {
 	return micros / IN_DIVISOR / 2;
 }
 
+/*
+ * The display thread receives inch messages from the consumer thread and
+ * prints those messages out to the terminal.
+ *
+ * If a valid number of inches is received, that number is printed immediately
+ * to the terminal.
+ *
+ * If an invalid number of inches is received, then this function will begin
+ * to print a flashing asterisk with a period of ASTER_FLASH_PERIOD_NANOS.
+ * Because this function uses the blocking mq_recieve family of functions to
+ * receive data from the consumer thread, it must timeout when the asterisk
+ * is to be flashed.
+ */
 static const int ASTER_FLASH_PERIOD_NANOS = 1000000000; /* 1 second */
 static const size_t MAX_BUF = 80;
 static void disp() {
 	mqd_t mq_d = mq_open(MQ_D_NAME, O_RDONLY);
 
-	struct timespec abs;
+	struct timespec abs; /* Absolute time at which to timeout of receive */
 
 	int inches = ULTRA_INVALID;
 	char msg[sizeof(inches)];
 
 	char buf[MAX_BUF];
-	int aster_on = 0;
+	int aster_on = 0; /* 0 => " ", 1 => "*" */
 
 	const int HALF_PERIOD = ASTER_FLASH_PERIOD_NANOS / 2;
 	struct timespec init, post, elap;
@@ -419,23 +509,30 @@ static void disp() {
 		thd_quit = quit;
 		pthread_mutex_unlock(&quit_mutex);
 
+		/* Timeout HALF_PERIOD nanos from now */
 		timing_future_nanos(&abs, HALF_PERIOD);
 		sz = mq_timedreceive(mq_d, msg, sizeof(inches), NULL, &abs);
 		if (sz > 0) {
 			memcpy(&inches, msg, sizeof(inches));
 			if (inches == QUEUE_PLUG) {
-				break;
+				break; /* Quit if no more data is to be received */
 			} else if (inches != ULTRA_INVALID) {
+				/* Save the valid inches to the display buffer */
 				snprintf(buf, MAX_BUF, "%d", inches);
 			}
 		} else {
 			//perror("");
 		}
 
+		/*
+		 * If the number of inches is invalid, we have to perform asterisk
+		 * flashing logic (until a number of valid inches is received
+		 */
 		if (inches == ULTRA_INVALID) {
-			clock_gettime(CLOCK_REALTIME, &post);
+			clock_gettime(CLOCK_REALTIME, &post); /* Current time */
+			/* Calculate elapsed time since we last changed the asterisk */
 			int neg = timing_timespec_sub(&elap, &post, &init);
-
+			/* If the elapsed time is greater than the half-period, flip it */
 			if (neg || elap.tv_nsec > HALF_PERIOD) {
 				if ((aster_on = !aster_on)) {
 					snprintf(buf, MAX_BUF, "%s", "*");
@@ -443,13 +540,14 @@ static void disp() {
 					snprintf(buf, MAX_BUF, "%s", " ");
 				}
 
+				/* Record time the asterisk was last changed (i.e., now) */
 				clock_gettime(CLOCK_REALTIME, &init);
 			}
 		}
 
+		/* Print out the contents of the buffer every cycle */
 		printf("\r%20s", "");
 		printf("\r%s", buf);
 		fflush(stdout);
 	}
 }
-

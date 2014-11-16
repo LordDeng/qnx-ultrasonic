@@ -5,7 +5,7 @@
 /*
  * Proj: 5
  * File: timing.c
- * Date: 6 November 2014
+ * Date: 15 November 2014
  * Auth: Steven Kroh (skk8768)
  *
  * Description:
@@ -30,8 +30,7 @@
  *         0      - If difference is positive
  */
 int timing_timespec_sub(result, x, y)
-	struct timespec *result, *x, *y;
-{
+	struct timespec *result, *x, *y; {
 	/* Perform the carry for the later subtraction by updating y. */
 	if (x->tv_nsec < y->tv_nsec) {
 		int nums = (y->tv_nsec - x->tv_nsec) / 1000000000 + 1;
@@ -53,16 +52,22 @@ int timing_timespec_sub(result, x, y)
 	return x->tv_sec < y->tv_sec;
 }
 
-void timing_future_nanos(struct timespec *future, long my_nanos)
-{
+/*
+ * This function records the current time in the provided timespec and then
+ * pushes that timespec the provided number of nanoseconds into the future.
+ *
+ * Params: future   - the absolute timespec in which to record a future time
+ *         my_nanos - the number of nanoseconds to go into the future
+ */
+void timing_future_nanos(struct timespec *future, long my_nanos) {
 	clock_gettime(CLOCK_REALTIME, future);
 	long rt_nanos = future->tv_nsec;
 
-	if(rt_nanos + my_nanos > 1000000000) {
+	if (rt_nanos + my_nanos > 1000000000) {
 		future->tv_nsec = (rt_nanos + my_nanos) - 1000000000;
 		future->tv_sec++;
 	} else {
 		future->tv_nsec += my_nanos;
-	} 
+	}
 }
 
