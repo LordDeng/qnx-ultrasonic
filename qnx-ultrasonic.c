@@ -45,26 +45,57 @@ static const char* MQ_D_NAME = "/mq_to_disp";
 static pthread_mutex_t quit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int quit;
 
-/*
- * Send STDIN_FILENO into raw mode
- */
-static void raw() {
-	struct termios tio;
+static unsigned int min_inches = 0xFFFFFFFF; /* UINT_MAX sentinel value */
+static unsigned int max_inches = 0x00000000; /* UINT_MIN sentinel value */
 
-	tcgetattr(STDIN_FILENO, &tio);
-	tio.c_lflag &= ~ICANON;
-	tcsetattr(STDIN_FILENO, TCSANOW, &tio);
+/*
+ * This implementation of raw() is from the QNX documentation at the following
+ * URL. The URL is split across multiple lines to fit within 80 chars. These
+ * splits are denoted by backwards slashes.
+ *
+ * http://www.qnx.com/developers/docs/660/index.jsp?topic=\
+ * %2Fcom.qnx.doc.neutrino.lib_ref%2Ftopic%2Ft%2Ftcsetattr.html\
+ * &resultof=%22tcsetattr%22%20
+ */
+static int raw(int fd) {
+	struct termios termios_p;
+
+	if (tcgetattr(fd, &termios_p))
+		return (-1);
+
+	termios_p.c_cc[VMIN] = 1;
+	termios_p.c_cc[VTIME] = 0;
+	termios_p.c_lflag &= ~(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHONL);
+	termios_p.c_oflag &= ~(OPOST);
+	return (tcsetattr(fd, TCSADRAIN, &termios_p));
+}
+
+static void raw_stdin() {
+	raw(0);
 }
 
 /*
- * Bring STDIN_FILENO out of raw mode
+ * This implementation of unraw() is from the QNX documentation at the following
+ * URL. The URL is split across multiple lines to fit within 80 chars. These
+ * splits are denoted by backwards slashes.
+ *
+ * http://www.qnx.com/developers/docs/660/index.jsp?topic=\
+ * %2Fcom.qnx.doc.neutrino.lib_ref%2Ftopic%2Ft%2Ftcsetattr.html\
+ * &resultof=%22tcsetattr%22%20
  */
-static void noraw() {
-	struct termios tio;
+static int unraw(int fd) {
+	struct termios termios_p;
 
-	tcgetattr(STDIN_FILENO, &tio);
-	tio.c_lflag |= ICANON;
-	tcsetattr(STDIN_FILENO, TCSANOW, &tio);
+	if (tcgetattr(fd, &termios_p))
+		return (-1);
+
+	termios_p.c_lflag |= (ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHONL);
+	termios_p.c_oflag |= (OPOST);
+	return (tcsetattr(fd, TCSADRAIN, &termios_p));
+}
+
+static void unraw_stdin() {
+	unraw(0);
 }
 
 /*
@@ -76,15 +107,11 @@ static void noraw() {
  */
 #define USE_STUB 0
 int main(int argc, char *argv[]) {
-//	raw(); /* Use raw mode so getchar() doesn't buffer */
-//	atexit(&noraw); /* At the end of the program, unraw stdin */
+	raw_stdin(); /* Use raw mode so getchar() doesn't buffer */
+	atexit(&unraw_stdin); /* At the end of the program, unraw stdin */
 
-	printf("Press any key to start measurements:\n");
-	getchar();
-
-	printf("You should not see this");
-	printf("\rYou should see this instead\n");
-
+	printf("Press any key to start measurements:\n\r");
+	printf("To end the program, press 'q' or 'Q'\n\r");
 	getchar();
 
 	quit = 0;
@@ -94,9 +121,12 @@ int main(int argc, char *argv[]) {
 	clk.nsec = 10000;
 	ClockPeriod(CLOCK_REALTIME, &clk, NULL, 0);
 
-	struct timespec res;
-	clock_getres(CLOCK_REALTIME, &res);
-	printf("res: %ld", res.tv_nsec);
+//	/*
+//	 * Use the code below to print out the realtime clock's resolution.
+//	 */
+//	struct timespec res;
+//	clock_getres(CLOCK_REALTIME, &res);
+//	printf("res: %ld", res.tv_nsec);
 
 	/* Destroy the queues if they already exist (to refresh params) */
 	mq_unlink(MQ_C_NAME);
@@ -158,7 +188,10 @@ int main(int argc, char *argv[]) {
 	pthread_join(thd_cons, NULL);
 	pthread_join(thd_disp, NULL);
 
-	printf("\rDone.\n");
+	printf("\r\nMinimum valid inches recorded: %d", min_inches);
+	printf("\r\nMaximum valid inches recorded: %d", max_inches);
+
+	printf("\r\n");
 
 	mq_close(mq_c);
 	mq_close(mq_d);
@@ -229,7 +262,7 @@ static int get_micros_ultrasonic(void) {
 	/* Poll b until high */
 	while (1) {
 		signed_pulse = ~in8(diob_handle);
-		if(signed_pulse ==  (uint8_t)0) {
+		if (signed_pulse == (uint8_t) 0) {
 			break;
 		}
 	}
@@ -238,7 +271,7 @@ static int get_micros_ultrasonic(void) {
 	/* Poll b until low */
 	while (1) {
 		signed_pulse = ~in8(diob_handle);
-		if (signed_pulse > (int8_t)0) {
+		if (signed_pulse > (int8_t) 0) {
 			break;
 		}
 	}
@@ -324,6 +357,8 @@ static void cons() {
 
 		inches = micros_to_inches(micros);
 		if (ULTRA_INC_LOBND <= inches && inches < ULTRA_EXC_HIBND) {
+			if(inches < min_inches) min_inches = inches;
+			if(inches > max_inches) max_inches = inches;
 		} else {
 			inches = ULTRA_INVALID;
 		}
@@ -392,8 +427,7 @@ static void disp() {
 			}
 		}
 
-		printf("\r%80s", "");
-		fflush(stdout);
+		printf("\r%20s", "");
 		printf("\r%s", buf);
 		fflush(stdout);
 	}
