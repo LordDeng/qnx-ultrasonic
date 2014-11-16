@@ -121,12 +121,12 @@ int main(int argc, char *argv[]) {
 	clk.nsec = 10000;
 	ClockPeriod(CLOCK_REALTIME, &clk, NULL, 0);
 
-//	/*
-//	 * Use the code below to print out the realtime clock's resolution.
-//	 */
-//	struct timespec res;
-//	clock_getres(CLOCK_REALTIME, &res);
-//	printf("res: %ld", res.tv_nsec);
+	//	/*
+	//	 * Use the code below to print out the realtime clock's resolution.
+	//	 */
+	//	struct timespec res;
+	//	clock_getres(CLOCK_REALTIME, &res);
+	//	printf("res: %ld", res.tv_nsec);
 
 	/* Destroy the queues if they already exist (to refresh params) */
 	mq_unlink(MQ_C_NAME);
@@ -284,6 +284,7 @@ static int get_micros_ultrasonic(void) {
 	return (elap.tv_nsec / 1000);
 }
 
+#define QUEUE_PLUG -2
 static void prod(int(*get_micros)(void)) {
 	mqd_t mq_c = mq_open(MQ_C_NAME, O_WRONLY);
 
@@ -329,9 +330,14 @@ static void prod(int(*get_micros)(void)) {
 			clock_nanosleep(CLOCK_REALTIME, 0, &elap, NULL);
 		}
 	}
+
+	micros = QUEUE_PLUG;
+	memcpy(msg, &micros, sizeof(micros));
+	mq_send(mq_c, msg, sizeof(micros), 0);
 }
 
-static const int ULTRA_EXC_HIBND = 20;
+//static const int ULTRA_EXC_HIBND = 20;
+static const int ULTRA_EXC_HIBND =  2147483647;
 static const int ULTRA_INC_LOBND = 0;
 static const int ULTRA_INVALID = -1;
 static void cons() {
@@ -351,22 +357,34 @@ static void cons() {
 		thd_quit = quit;
 		pthread_mutex_unlock(&quit_mutex);
 
-		timing_future_nanos(&abs, 500000000);
-		mq_timedreceive(mq_c, msg, sizeof(micros), NULL, &abs);
+//		timing_future_nanos(&abs, 500000000);
+//		mq_timedreceive(mq_c, msg, sizeof(micros), NULL, &abs);
+		mq_receive(mq_c, msg, sizeof(micros), NULL);
 		memcpy(&micros, msg, sizeof(micros));
+
+		if (micros == QUEUE_PLUG) {
+			break;
+		}
 
 		inches = micros_to_inches(micros);
 		if (ULTRA_INC_LOBND <= inches && inches < ULTRA_EXC_HIBND) {
-			if(inches < min_inches) min_inches = inches;
-			if(inches > max_inches) max_inches = inches;
+			if (inches < min_inches)
+				min_inches = inches;
+			if (inches > max_inches)
+				max_inches = inches;
 		} else {
 			inches = ULTRA_INVALID;
 		}
 
-		timing_future_nanos(&abs, 500000000);
+//		timing_future_nanos(&abs, 500000000);
 		memcpy(msg, &inches, sizeof(inches));
-		mq_timedsend(mq_d, msg, sizeof(inches), 0, &abs);
+//		mq_timedsend(mq_d, msg, sizeof(inches), 0, &abs);
+		mq_send(mq_d, msg, sizeof(inches), 0);
 	}
+
+	inches = QUEUE_PLUG;
+	memcpy(msg, &inches, sizeof(inches));
+	mq_send(mq_d, msg, sizeof(inches), 0);
 }
 
 static const int IN_DIVISOR = 71;
@@ -405,7 +423,9 @@ static void disp() {
 		sz = mq_timedreceive(mq_d, msg, sizeof(inches), NULL, &abs);
 		if (sz > 0) {
 			memcpy(&inches, msg, sizeof(inches));
-			if (inches != ULTRA_INVALID) {
+			if (inches == QUEUE_PLUG) {
+				break;
+			} else if (inches != ULTRA_INVALID) {
 				snprintf(buf, MAX_BUF, "%d", inches);
 			}
 		} else {
